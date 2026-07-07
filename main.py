@@ -71,13 +71,13 @@ class VultrTavilyBot2026(ForecastBot):
     logging, and Tavily budget control (free-tier safe).
     """
 
-    _max_concurrent_questions = 1  # Conservative for free Tavily + Vultr limits
-    _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
+    _max_concurrent_questions = 2  # Parallel questions; Tavily budget still caps searches
     _structure_output_validation_samples = 1  # Save Vultr tokens on parser
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._context_cache: dict[str, QuestionContext] = {}
+        self._context_build_locks: dict[str, asyncio.Lock] = {}
         self.tavily_budget = TavilyBudget.from_env()
         self.calibration_logger = CalibrationLogger()
         self._current_context: QuestionContext | None = None
@@ -100,9 +100,15 @@ class VultrTavilyBot2026(ForecastBot):
 
     async def _get_question_context(self, question: MetaculusQuestion) -> QuestionContext:
         key = question_cache_key(question)
-        if key not in self._context_cache:
-            fast_llm = self.get_llm("fast", "llm")
-            self._context_cache[key] = await build_question_context(question, fast_llm)
+        if key in self._context_cache:
+            return self._context_cache[key]
+        lock = self._context_build_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if key not in self._context_cache:
+                fast_llm = self.get_llm("fast", "llm")
+                self._context_cache[key] = await build_question_context(
+                    question, fast_llm
+                )
         return self._context_cache[key]
 
     async def _invoke_forecast_llm(self, prompt: str) -> str:
@@ -131,95 +137,94 @@ class VultrTavilyBot2026(ForecastBot):
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
-        async with self._concurrency_limiter:
-            context = await self._get_question_context(question)
-            self._current_context = context
-            researcher = self.get_llm("researcher")
+        # No global lock here — parent runs research_reports_per_question in parallel.
+        # Tavily deduplication + budget live in TavilyBudget.cached_or_fetch.
+        context = await self._get_question_context(question)
+        self._current_context = context
+        researcher = self.get_llm("researcher")
 
-            if researcher in ("tavily", "tavily/raw"):
-                summarizer = (
-                    None
-                    if researcher == "tavily/raw"
-                    else self.get_llm("summarizer", "llm")
-                )
-                research = await run_tavily_research(
-                    question, context, self.tavily_budget, summarizer=summarizer
-                )
-            elif isinstance(researcher, GeneralLlm):
-                prompt = clean_indents(
-                    f"""
-                    You are an assistant to a superforecaster.
-                    The superforecaster will give you a question they intend to forecast on.
-                    To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-                    You do not produce forecasts yourself.
+        if researcher in ("tavily", "tavily/raw"):
+            summarizer = (
+                None
+                if researcher == "tavily/raw"
+                else self.get_llm("summarizer", "llm")
+            )
+            research = await run_tavily_research(
+                question, context, self.tavily_budget, summarizer=summarizer
+            )
+        elif isinstance(researcher, GeneralLlm):
+            prompt = clean_indents(
+                f"""
+                You are an assistant to a superforecaster.
+                The superforecaster will give you a question they intend to forecast on.
+                To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
+                You do not produce forecasts yourself.
 
-                    Question:
-                    {question.question_text}
+                Question:
+                {question.question_text}
 
-                    This question's outcome will be determined by the specific criteria below:
-                    {question.resolution_criteria}
+                This question's outcome will be determined by the specific criteria below:
+                {question.resolution_criteria}
 
-                    {question.fine_print}
-                    """
-                )
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                prompt = clean_indents(
-                    f"""
-                    Question:
-                    {question.question_text}
+                {question.fine_print}
+                """
+            )
+            research = await researcher.invoke(prompt)
+        elif (
+            researcher == "asknews/news-summaries"
+            or researcher == "asknews/deep-research/low-depth"
+            or researcher == "asknews/deep-research/medium-depth"
+            or researcher == "asknews/deep-research/high-depth"
+        ):
+            prompt = clean_indents(
+                f"""
+                Question:
+                {question.question_text}
 
-                    Resolution criteria:
-                    {question.resolution_criteria}
+                Resolution criteria:
+                {question.resolution_criteria}
 
-                    {question.fine_print}
-                    """
-                )
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
-                )
-            elif isinstance(researcher, str) and researcher.startswith(
-                "smart-searcher"
-            ):
-                model_name = researcher.removeprefix("smart-searcher/")
-                prompt = clean_indents(
-                    f"""
-                    You are an assistant to a superforecaster.
-                    The superforecaster will give you a question they intend to forecast on.
-                    To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-                    You do not produce forecasts yourself.
+                {question.fine_print}
+                """
+            )
+            research = await AskNewsSearcher().call_preconfigured_version(
+                researcher, prompt
+            )
+        elif isinstance(researcher, str) and researcher.startswith("smart-searcher"):
+            model_name = researcher.removeprefix("smart-searcher/")
+            prompt = clean_indents(
+                f"""
+                You are an assistant to a superforecaster.
+                The superforecaster will give you a question they intend to forecast on.
+                To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
+                You do not produce forecasts yourself.
 
-                    Question:
-                    {question.question_text}
+                Question:
+                {question.question_text}
 
-                    This question's outcome will be determined by the specific criteria below:
-                    {question.resolution_criteria}
+                This question's outcome will be determined by the specific criteria below:
+                {question.resolution_criteria}
 
-                    {question.fine_print}
-                    """
-                )
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(
-                    question.question_text
-                )
+                {question.fine_print}
+                """
+            )
+            searcher = SmartSearcher(
+                model=model_name,
+                temperature=0,
+                num_searches_to_run=2,
+                num_sites_per_search=10,
+                use_advanced_filters=False,
+            )
+            research = await searcher.invoke(prompt)
+        elif not researcher or researcher == "None" or researcher == "no_research":
+            research = ""
+        else:
+            research = await self.get_llm("researcher", "llm").invoke(
+                question.question_text
+            )
 
-            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
-            return research
+        logger.info(f"Found Research for URL {question.page_url}:\n{research}")
+        return research
 
     async def _research_and_make_predictions(self, question: MetaculusQuestion):
         from forecasting_tools.forecast_bots.forecast_bot import ResearchWithPredictions
@@ -789,7 +794,7 @@ if __name__ == "__main__":
     parser_model = os.getenv("VULTR_PARSER_MODEL", fast_model)
 
     template_bot = VultrTavilyBot2026(
-        research_reports_per_question=1,
+        research_reports_per_question=2,
         predictions_per_research_report=3,
         use_research_summary_to_forecast=True,
         publish_reports_to_metaculus=publish_to_metaculus,

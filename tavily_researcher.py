@@ -2,7 +2,7 @@
 Tavily-backed research for the forecasting bot (free-tier conservative).
 
 Uses basic search depth, strict per-question/run budgets, in-memory caching,
-and decomposition-driven queries so each credit counts.
+decomposition-driven queries, and parallel search execution.
 """
 from __future__ import annotations
 
@@ -23,6 +23,17 @@ VULTR_INFERENCE_BASE_URL = "https://api.vultrinference.com/v1"
 # Free tier: basic depth only, minimal results, no raw content extraction.
 TAVILY_SEARCH_DEPTH = "basic"
 TAVILY_MAX_RESULTS = 4
+
+# Cap concurrent Tavily HTTP calls (parallel within a question, bounded globally).
+_tavily_http_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_tavily_semaphore() -> asyncio.Semaphore:
+    global _tavily_http_semaphore
+    if _tavily_http_semaphore is None:
+        limit = int(os.getenv("TAVILY_MAX_CONCURRENT_SEARCHES", "3"))
+        _tavily_http_semaphore = asyncio.Semaphore(limit)
+    return _tavily_http_semaphore
 
 
 def make_vultr_llm(
@@ -112,24 +123,29 @@ async def _run_budgeted_search(
         kwargs["topic"] = topic
     if time_range:
         kwargs["time_range"] = time_range
-    return await client.search(query, **kwargs)
+    async with _get_tavily_semaphore():
+        return await client.search(query, **kwargs)
 
 
-async def gather_tavily_sources(
+def _query_search_params(query: str) -> tuple[str, str | None]:
+    topic = "news" if any(
+        w in query.lower() for w in ("news", "latest", "recent", "today")
+    ) else "general"
+    time_range = "week" if topic == "news" else None
+    return topic, time_range
+
+
+async def _fetch_tavily_source_pack(
     question: MetaculusQuestion,
     context: QuestionContext,
     budget: TavilyBudget,
 ) -> str:
-    """Run a minimal set of Tavily basic searches driven by decomposition."""
-    cache_key = question_cache_key(question)
-    cached = budget.get_cached(cache_key)
-    if cached:
-        return cached
-
+    """Execute parallel Tavily basic searches for decomposed queries."""
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key or api_key.strip() in {"REPLACE_ME", "your-api-key-here"}:
         raise ValueError("TAVILY_API_KEY is missing or still a placeholder.")
 
+    cache_key = question_cache_key(question)
     allowed = budget.remaining_for_question(cache_key)
     if allowed <= 0:
         return "_Tavily budget exhausted; rely on base-rate and resolution analysis._"
@@ -139,34 +155,55 @@ async def gather_tavily_sources(
     if not queries:
         queries = [question.question_text[:120]]
 
-    searches: list[dict[str, Any]] = []
-    for query in queries:
-        if budget.searches_used >= budget.max_per_run:
-            logger.warning("Tavily run budget exhausted at %s searches", budget.searches_used)
-            break
-        topic = "news" if any(
-            w in query.lower() for w in ("news", "latest", "recent", "today")
-        ) else "general"
-        time_range = "week" if topic == "news" else None
+    run_slots = budget.max_per_run - budget.searches_used
+    queries = queries[: max(0, run_slots)]
+    if not queries:
+        return "_Tavily run budget exhausted._"
+
+    async def run_one(query: str) -> tuple[str, dict[str, Any] | BaseException]:
+        topic, time_range = _query_search_params(query)
         try:
             result = await _run_budgeted_search(
                 client, query, topic=topic, time_range=time_range
             )
-            searches.append(result)
-            budget.record_search(cache_key)
+            return query, result
         except Exception as exc:
             logger.warning("Tavily search failed for %r: %s", query, exc)
+            return query, exc
 
+    logger.info(
+        "Running %s Tavily searches in parallel for %s",
+        len(queries),
+        question.page_url,
+    )
+    pairs = await asyncio.gather(*(run_one(q) for q in queries))
+
+    searches: list[tuple[str, dict[str, Any]]] = []
+    for query, result in pairs:
+        if isinstance(result, dict):
+            budget.record_search(cache_key)
+            searches.append((query, result))
     if not searches:
         return "_No Tavily results (budget or API error)._"
 
     sections = [
-        _format_search_result_block(f"Search: {queries[i][:80]}", resp)
-        for i, resp in enumerate(searches)
+        _format_search_result_block(f"Search: {query[:80]}", resp)
+        for query, resp in searches
     ]
-    source_pack = "\n\n".join(sections)
-    budget.set_cache(cache_key, source_pack)
-    return source_pack
+    return "\n\n".join(sections)
+
+
+async def gather_tavily_sources(
+    question: MetaculusQuestion,
+    context: QuestionContext,
+    budget: TavilyBudget,
+) -> str:
+    """Run parallel Tavily searches with per-question deduplication."""
+    cache_key = question_cache_key(question)
+    return await budget.cached_or_fetch(
+        cache_key,
+        lambda: _fetch_tavily_source_pack(question, context, budget),
+    )
 
 
 async def synthesize_grounded_research(

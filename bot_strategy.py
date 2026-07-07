@@ -87,6 +87,7 @@ class TavilyBudget:
     max_per_run: int = 40
     searches_used: int = 0
     _cache: dict[str, str] = field(default_factory=dict)
+    _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> TavilyBudget:
@@ -94,6 +95,26 @@ class TavilyBudget:
             max_per_question=int(os.getenv("TAVILY_MAX_SEARCHES_PER_QUESTION", "2")),
             max_per_run=int(os.getenv("TAVILY_MAX_SEARCHES_PER_RUN", "40")),
         )
+
+    def _lock_for(self, question_key: str) -> asyncio.Lock:
+        if question_key not in self._locks:
+            self._locks[question_key] = asyncio.Lock()
+        return self._locks[question_key]
+
+    async def cached_or_fetch(
+        self, question_key: str, fetch: Any
+    ) -> str:
+        """Deduplicate concurrent research fetches for the same question."""
+        cached = self.get_cached(question_key)
+        if cached:
+            return cached
+        async with self._lock_for(question_key):
+            cached = self.get_cached(question_key)
+            if cached:
+                return cached
+            result = await fetch()
+            self.set_cache(question_key, result)
+            return result
 
     def remaining_for_question(self, question_key: str) -> int:
         if question_key in self._cache:
