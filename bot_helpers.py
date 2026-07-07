@@ -70,13 +70,24 @@ def check_environment(strict: bool = True) -> None:
 
     has_llm_key = any(
         _is_real_env(k)
-        for k in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+        for k in (
+            "VULTR_SERVERLESS_INFERENCE_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+        )
     )
     if not has_llm_key:
         print(
-            "⚠️  No LLM key set (OPENROUTER/OPENAI/ANTHROPIC). The bot will fall back\n"
+            "⚠️  No LLM key set (VULTR/OPENROUTER/OPENAI/ANTHROPIC). The bot will fall back\n"
             "    to the Metaculus LLM proxy. Free OpenRouter credits: "
             "https://forms.gle/aQdYMq9Pisrf1v7d8\n"
+        )
+
+    if not _is_real_env("TAVILY_API_KEY"):
+        print(
+            "⚠️  TAVILY_API_KEY is missing. Tavily research will fail unless you switch\n"
+            "    the researcher setting away from 'tavily'.\n"
         )
 
     if problems:

@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -13,6 +14,21 @@ from bot_helpers import (
     print_startup_banner,
     silence_noisy_dependencies,
 )
+from tavily_researcher import make_vultr_llm, run_tavily_research
+from bot_strategy import (
+    FORECAST_TEMPERATURES,
+    CalibrationLogger,
+    QuestionContext,
+    TavilyBudget,
+    aggregate_binary_trimmed,
+    aggregate_multiple_choice_trimmed,
+    aggregate_numeric_trimmed,
+    build_forecast_preamble,
+    build_question_context,
+    enrich_research_with_context,
+    question_cache_key,
+    research_grounding_instructions,
+)
 
 silence_noisy_dependencies()
 
@@ -20,6 +36,7 @@ from forecasting_tools import (
     AskNewsSearcher,
     BinaryQuestion,
     ForecastBot,
+    ForecastReport,
     GeneralLlm,
     MetaculusClient,
     MetaculusQuestion,
@@ -45,97 +62,97 @@ dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-class SummerTemplateBot2026(ForecastBot):
+class VultrTavilyBot2026(ForecastBot):
     """
-    This is the template bot for Summer 2026 Metaculus AI Tournament.
-    This is a copy of what is used by Metaculus to run the Metac Bots in our benchmark, provided as a template for new bot makers.
-    This template is given as-is, and is use-at-your-own-risk.
-    We have covered most test cases in forecasting-tools it may be worth double checking key components locally.
-    So far our track record has been 1 mentionable bug per season (affecting forecasts for 1-2% of total questions)
+    Top-tier strategy bot: Vultr inference + conservative Tavily research.
 
-    Main changes since Fall:
-    - Additional prompting has been added to numeric questions to emphasize putting pecentile values in the correct order.
-    - Support for conditional and date questions has been added
-    - Note: Summer AIB will not use date/conditional questions, so these are only for forecasting on the main site as you wish.
-
-    The main entry point of this bot is `bot.forecast_on_tournament(tournament_id)` in the parent class.
-    See the script at the bottom of the file for more details on how to run the bot.
-    Ignoring the finer details, the general flow is:
-    - Load questions from Metaculus
-    - For each question
-        - Execute run_research a number of times equal to research_reports_per_question
-        - Execute respective run_forecast function `predictions_per_research_report * research_reports_per_question` times
-        - Aggregate the predictions
-        - Submit prediction (if publish_reports_to_metaculus is True)
-    - Return a list of ForecastReport objects
-
-    Alternatively, you can use the MetaculusClient to make a custom filter of questions to forecast on
-    and forecast them with `bot.forecast_questions(questions)`
-
-    Only the research and forecast functions need to be implemented in ForecastBot subclasses,
-    though you may want to override other ForecastBot functions.
-    In this example, you can change the prompts to be whatever you want since,
-    structure_output uses an LLM to intelligently reformat the output into the needed structure.
-
-    By default (i.e. 'tournament' mode), when you run this script, it will forecast on any open questions in the
-    primary bot tournament and MiniBench. If you want to forecast on only one or the other, you can remove one
-    of them from the 'tournament' mode code at the bottom of the file.
-
-    You can experiment with what models work best with your bot by using the `llms` parameter when initializing the bot.
-    You can initialize the bot with any number of models. For example,
-    ```python
-    my_bot = MyBot(
-        ...
-        llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-            "default": GeneralLlm(
-                model="openrouter/openai/gpt-4o", # "anthropic/claude-sonnet-4-20250514", etc (see docs for litellm)
-                temperature=0.3,
-                timeout=40,
-                allowed_tries=2,
-            ),
-            "summarizer": "openai/gpt-4o-mini",
-            "researcher": "asknews/news-summaries",
-            "parser": "openai/gpt-4o-mini",
-        },
-    )
-    ```
-
-    Then you can access the model in custom functions like this:
-    ```python
-    research_strategy = self.get_llm("researcher", "model_name"
-    if research_strategy == "asknews/news-summaries":
-        ...
-    # OR
-    summarizer = await self.get_llm("summarizer", "llm").invoke(prompt)
-    # OR
-    reasoning = await self.get_llm("default", "llm").invoke(prompt)
-    ```
-
-    If you end up having trouble with rate limits and want to try a more sophisticated rate limiter try:
-    ```python
-    from forecasting_tools import RefreshingBucketRateLimiter
-    rate_limiter = RefreshingBucketRateLimiter(
-        capacity=2,
-        refresh_rate=1,
-    ) # Allows 1 request per second on average with a burst of 2 requests initially. Set this as a class variable
-    await self.rate_limiter.wait_till_able_to_acquire_resources(1) # 1 because it's consuming 1 request (use more if you are adding a token limit)
-    ```
-    Additionally OpenRouter has large rate limits immediately on account creation
+    Implements decomposition, base rates, time-horizon calibration, trimmed
+    aggregation, resolution parsing, per-type prompts, model routing, calibration
+    logging, and Tavily budget control (free-tier safe).
     """
 
-    _max_concurrent_questions = (
-        1  # Set this to whatever works for your search-provider/ai-model rate limits
-    )
-    _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
-    _structure_output_validation_samples = 2
+    _max_concurrent_questions = 2  # Parallel questions; Tavily budget still caps searches
+    _structure_output_validation_samples = 1  # Save Vultr tokens on parser
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._context_cache: dict[str, QuestionContext] = {}
+        self._context_build_locks: dict[str, asyncio.Lock] = {}
+        self.tavily_budget = TavilyBudget.from_env()
+        self.calibration_logger = CalibrationLogger()
+        self._current_context: QuestionContext | None = None
+        self._sample_index = 0
+        self._forecast_llms: dict[float, GeneralLlm] = {}
+        self._init_forecast_llms()
+
+    def _init_forecast_llms(self) -> None:
+        strong = self._llms.get("strong") or self._llms.get("default")
+        if isinstance(strong, GeneralLlm):
+            raw_model = strong.model
+            model_name = raw_model.removeprefix("openai/")
+            timeout = strong.litellm_kwargs.get("timeout", 120)
+            for temp in FORECAST_TEMPERATURES:
+                self._forecast_llms[temp] = make_vultr_llm(
+                    model=model_name,
+                    temperature=temp,
+                    timeout=timeout,
+                )
+
+    async def _get_question_context(self, question: MetaculusQuestion) -> QuestionContext:
+        key = question_cache_key(question)
+        if key in self._context_cache:
+            return self._context_cache[key]
+        lock = self._context_build_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if key not in self._context_cache:
+                fast_llm = self.get_llm("fast", "llm")
+                self._context_cache[key] = await build_question_context(
+                    question, fast_llm
+                )
+        return self._context_cache[key]
+
+    async def _invoke_forecast_llm(self, prompt: str) -> str:
+        context = self._current_context
+        temp = FORECAST_TEMPERATURES[self._sample_index % len(FORECAST_TEMPERATURES)]
+        if context and context.difficulty == "hard":
+            return await self.get_llm("strong", "llm").invoke(prompt)
+        llm = self._forecast_llms.get(temp) or self.get_llm("default", "llm")
+        return await llm.invoke(prompt)
+
+    def _research_grounding_instructions(self) -> str:
+        return research_grounding_instructions()
+
+    def _forecast_preamble(self, research: str) -> str:
+        if self._current_context:
+            return clean_indents(
+                f"""
+                {build_forecast_preamble(self._current_context)}
+
+                ## Research report
+                {research}
+                """
+            )
+        return research
 
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
-        async with self._concurrency_limiter:
-            research = ""
-            researcher = self.get_llm("researcher")
+        # No global lock here — parent runs research_reports_per_question in parallel.
+        # Tavily deduplication + budget live in TavilyBudget.cached_or_fetch.
+        context = await self._get_question_context(question)
+        self._current_context = context
+        researcher = self.get_llm("researcher")
 
+        if researcher in ("tavily", "tavily/raw"):
+            summarizer = (
+                None
+                if researcher == "tavily/raw"
+                else self.get_llm("summarizer", "llm")
+            )
+            research = await run_tavily_research(
+                question, context, self.tavily_budget, summarizer=summarizer
+            )
+        elif isinstance(researcher, GeneralLlm):
             prompt = clean_indents(
                 f"""
                 You are an assistant to a superforecaster.
@@ -152,34 +169,138 @@ class SummerTemplateBot2026(ForecastBot):
                 {question.fine_print}
                 """
             )
+            research = await researcher.invoke(prompt)
+        elif (
+            researcher == "asknews/news-summaries"
+            or researcher == "asknews/deep-research/low-depth"
+            or researcher == "asknews/deep-research/medium-depth"
+            or researcher == "asknews/deep-research/high-depth"
+        ):
+            prompt = clean_indents(
+                f"""
+                Question:
+                {question.question_text}
 
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
-                )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
-            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
-            return research
+                Resolution criteria:
+                {question.resolution_criteria}
+
+                {question.fine_print}
+                """
+            )
+            research = await AskNewsSearcher().call_preconfigured_version(
+                researcher, prompt
+            )
+        elif isinstance(researcher, str) and researcher.startswith("smart-searcher"):
+            model_name = researcher.removeprefix("smart-searcher/")
+            prompt = clean_indents(
+                f"""
+                You are an assistant to a superforecaster.
+                The superforecaster will give you a question they intend to forecast on.
+                To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
+                You do not produce forecasts yourself.
+
+                Question:
+                {question.question_text}
+
+                This question's outcome will be determined by the specific criteria below:
+                {question.resolution_criteria}
+
+                {question.fine_print}
+                """
+            )
+            searcher = SmartSearcher(
+                model=model_name,
+                temperature=0,
+                num_searches_to_run=2,
+                num_sites_per_search=10,
+                use_advanced_filters=False,
+            )
+            research = await searcher.invoke(prompt)
+        elif not researcher or researcher == "None" or researcher == "no_research":
+            research = ""
+        else:
+            research = await self.get_llm("researcher", "llm").invoke(
+                question.question_text
+            )
+
+        logger.info(f"Found Research for URL {question.page_url}:\n{research}")
+        return research
+
+    async def _research_and_make_predictions(self, question: MetaculusQuestion):
+        from forecasting_tools.forecast_bots.forecast_bot import ResearchWithPredictions
+
+        context = await self._get_question_context(question)
+        self._current_context = context
+        notepad = await self._get_notepad(question)
+        notepad.total_research_reports_attempted += 1
+        research = await self.run_research(question)
+        summary_report = await self.summarize_research(question, research)
+        research_to_use = (
+            summary_report if self.use_research_summary_to_forecast else research
+        )
+        enriched = enrich_research_with_context(research_to_use, context)
+
+        tasks = [
+            self._make_prediction_with_sample(question, enriched, i)
+            for i in range(self.predictions_per_research_report)
+        ]
+        valid_predictions, errors, exception_group = (
+            await self._gather_results_and_exceptions(tasks)
+        )
+        if errors:
+            logger.warning(f"Encountered errors while predicting: {errors}")
+        if len(valid_predictions) == 0:
+            assert exception_group
+            self._reraise_exception_with_prepended_message(
+                exception_group,
+                "Error while running research and predictions",
+            )
+        return ResearchWithPredictions(
+            research_report=research,
+            summary_report=summary_report,
+            errors=errors,
+            predictions=valid_predictions,
+        )
+
+    async def _make_prediction_with_sample(
+        self, question: MetaculusQuestion, research: str, sample_index: int
+    ):
+        self._sample_index = sample_index
+        return await self._make_prediction(question, research)
+
+    async def _aggregate_predictions(
+        self, predictions: list[PredictionTypes], question: MetaculusQuestion
+    ) -> PredictionTypes:
+        if not predictions:
+            raise ValueError("Cannot aggregate empty list of predictions")
+        if isinstance(question, BinaryQuestion):
+            return aggregate_binary_trimmed(predictions)  # type: ignore[arg-type]
+        if isinstance(question, MultipleChoiceQuestion):
+            return aggregate_multiple_choice_trimmed(predictions)  # type: ignore[arg-type]
+        if isinstance(question, (NumericQuestion, DateQuestion)):
+            return aggregate_numeric_trimmed(predictions, question)  # type: ignore[arg-type]
+        report_type = DataOrganizer.get_report_type_for_question_type(type(question))
+        return await report_type.aggregate_predictions(predictions, question)
+
+    async def _run_individual_question(self, question: MetaculusQuestion) -> ForecastReport:
+        report = await super()._run_individual_question(question)
+        try:
+            self.calibration_logger.log_forecast(
+                question=question,
+                prediction=report.prediction,
+                community_prediction=getattr(
+                    question, "community_prediction_at_access_time", None
+                ),
+                question_type=type(question).__name__,
+            )
+        except Exception as exc:
+            logger.warning("Calibration logging failed: %s", exc)
+        logger.info(
+            "Tavily searches used this run: %s/%s",
+            self.tavily_budget.searches_used,
+            self.tavily_budget.max_per_run,
+        )
+        return report
 
     ##################################### BINARY QUESTIONS #####################################
 
@@ -204,17 +325,18 @@ class SummerTemplateBot2026(ForecastBot):
 
 
             Your research assistant says:
-            {research}
+            {self._forecast_preamble(research)}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
+            (b) The status quo outcome if nothing changed — start from the base rate.
             (c) A brief description of a scenario that results in a No outcome.
             (d) A brief description of a scenario that results in a Yes outcome.
+            (e) How much to update from the base rate given cited evidence.
 
-            You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
+            You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, adjusted for time horizon guidance above.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
@@ -228,7 +350,7 @@ class SummerTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecast_llm(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         binary_prediction: BinaryPrediction = await structure_output(
             reasoning,
@@ -267,7 +389,7 @@ class SummerTemplateBot2026(ForecastBot):
 
 
             Your research assistant says:
-            {research}
+            {self._forecast_preamble(research)}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
@@ -302,7 +424,7 @@ class SummerTemplateBot2026(ForecastBot):
             Additionally, you may sometimes need to parse a 0% probability. Please do not skip options with 0% but rather make it an entry in your final list with 0% probability.
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecast_llm(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning,
@@ -344,7 +466,7 @@ class SummerTemplateBot2026(ForecastBot):
             Units for answer: {question.unit_of_measure if question.unit_of_measure else "Not stated (please infer this)"}
 
             Your research assistant says:
-            {research}
+            {self._forecast_preamble(research)}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
@@ -358,9 +480,9 @@ class SummerTemplateBot2026(ForecastBot):
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
+            (b) The current value / status quo baseline from research.
             (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
+            (d) The expectations of experts and markets (from research).
             (e) A brief description of an unexpected scenario that results in a low outcome.
             (f) A brief description of an unexpected scenario that results in a high outcome.
 
@@ -385,7 +507,7 @@ class SummerTemplateBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecast_llm(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -436,7 +558,7 @@ class SummerTemplateBot2026(ForecastBot):
             {question.fine_print}
 
             Your research assistant says:
-            {research}
+            {self._forecast_preamble(research)}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
@@ -451,7 +573,7 @@ class SummerTemplateBot2026(ForecastBot):
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
+            (b) The current timeline / status quo from research.
             (c) The outcome if the current trend continued.
             (d) The expectations of experts and markets.
             (e) A brief description of an unexpected scenario that results in a low outcome.
@@ -479,7 +601,7 @@ class SummerTemplateBot2026(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecast_llm(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -667,28 +789,28 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
-    template_bot = SummerTemplateBot2026(
-        research_reports_per_question=1,
-        predictions_per_research_report=5,
-        use_research_summary_to_forecast=False,
+    default_model = os.getenv("VULTR_INFERENCE_MODEL", "meta-llama/Llama-3.3-70B-Instruct")
+    fast_model = os.getenv("VULTR_FAST_MODEL", default_model)
+    parser_model = os.getenv("VULTR_PARSER_MODEL", fast_model)
+
+    template_bot = VultrTavilyBot2026(
+        research_reports_per_question=2,
+        predictions_per_research_report=3,
+        use_research_summary_to_forecast=True,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        extra_metadata_in_explanation=False,
+        llms={
+            "default": make_vultr_llm(model=default_model, temperature=0.3, timeout=120),
+            "strong": make_vultr_llm(model=default_model, temperature=0.35, timeout=150),
+            "fast": make_vultr_llm(model=fast_model, temperature=0.1, timeout=60),
+            "summarizer": make_vultr_llm(
+                model=default_model, temperature=0.2, timeout=120
+            ),
+            "researcher": "tavily",
+            "parser": make_vultr_llm(model=parser_model, temperature=0, timeout=60),
+        },
     )
 
     # Per-mode tournament URL shown in the summary banner footer. These
