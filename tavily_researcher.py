@@ -238,6 +238,7 @@ async def synthesize_grounded_research(
         Format:
         ## Key facts (with [n] citations)
         ## Resolution-relevant signals
+        ## Prediction markets (Kalshi, Polymarket — exact prices if found)
         ## Base rate vs current evidence
         ## Gaps / unknowns
         ## Sources (URL list)

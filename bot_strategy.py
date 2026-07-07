@@ -66,6 +66,35 @@ class BaseRateAnalysis(BaseModel):
     )
 
 
+class MarketSignals(BaseModel):
+    """Prediction-market and crowd prices extracted from research (0–1 scale)."""
+
+    kalshi_yes: float | None = Field(
+        default=None, description="Kalshi Yes price/probability if found"
+    )
+    polymarket_yes: float | None = Field(
+        default=None, description="Polymarket Yes price/probability if found"
+    )
+    other_markets_note: str | None = Field(
+        default=None, description="Other relevant market prices mentioned"
+    )
+
+    @staticmethod
+    def _clamp_prob(value: float | None) -> float | None:
+        if value is None:
+            return None
+        return max(0.01, min(0.99, float(value)))
+
+
+# Weights for final binary blend (renormalized when anchors are missing).
+BINARY_BLEND_WEIGHTS = {
+    "model_median": 0.45,
+    "metaculus": 0.25,
+    "kalshi": 0.15,
+    "polymarket": 0.15,
+}
+
+
 @dataclass
 class QuestionContext:
     """Cached per-question analysis used across research and forecasting."""
@@ -235,23 +264,75 @@ def compute_time_horizon_brief(question: MetaculusQuestion) -> str:
     )
 
 
-def community_anchor_brief(question: MetaculusQuestion) -> str:
+def community_anchor_brief(
+    question: MetaculusQuestion,
+    market_signals: MarketSignals | None = None,
+) -> str:
+    lines = []
     community = getattr(question, "community_prediction_at_access_time", None)
-    if community is None:
-        return "Community anchor: no community prediction available — rely on research and base rates."
-
-    if isinstance(question, BinaryQuestion):
-        return clean_indents(
-            f"""
-            Community anchor: Metaculus crowd currently at {community:.1%} Yes.
-            Treat this as a weak prior to sanity-check your forecast, not as ground truth.
-            Deviate only with specific cited evidence from research.
-            """
+    if community is not None and isinstance(question, BinaryQuestion):
+        lines.append(
+            f"- **Metaculus crowd:** {community:.1%} Yes (weak anchor — deviate only with cited evidence)"
         )
-    return (
-        f"Community anchor: crowd prediction available ({community}). "
-        "Use as weak sanity check only."
+    elif community is not None:
+        lines.append(f"- **Metaculus crowd:** {community} (weak sanity check)")
+
+    if market_signals:
+        if market_signals.kalshi_yes is not None:
+            lines.append(
+                f"- **Kalshi market:** {market_signals.kalshi_yes:.1%} Yes"
+            )
+        if market_signals.polymarket_yes is not None:
+            lines.append(
+                f"- **Polymarket:** {market_signals.polymarket_yes:.1%} Yes"
+            )
+        if market_signals.other_markets_note:
+            lines.append(f"- **Other markets:** {market_signals.other_markets_note}")
+
+    if not lines:
+        return (
+            "Market anchors: none found yet — after research, use any Kalshi/Polymarket/"
+            "Metaculus prices as weak priors only."
+        )
+    return clean_indents(
+        f"""
+        Market anchors (use as weak priors; final forecast blends model + crowds):
+        {chr(10).join(lines)}
+        """
     )
+
+
+async def extract_market_signals(
+    question: MetaculusQuestion, research: str, llm: GeneralLlm
+) -> MarketSignals:
+    """Parse Kalshi/Polymarket prices from the research brief."""
+    prompt = clean_indents(
+        f"""
+        Extract prediction-market prices from this research for:
+        "{question.question_text}"
+
+        Rules:
+        - kalshi_yes / polymarket_yes must be 0–1 probabilities (e.g. 65% → 0.65).
+        - Use null if a market is not mentioned or no clear price exists.
+        - Do not guess prices not stated in the text.
+
+        Research:
+        {research[:12000]}
+        """
+    )
+    try:
+        reasoning = await llm.invoke(prompt)
+        parsed: MarketSignals = await structure_output(
+            reasoning, MarketSignals, model=llm, num_validation_samples=1
+        )
+        return MarketSignals(
+            kalshi_yes=MarketSignals._clamp_prob(parsed.kalshi_yes),
+            polymarket_yes=MarketSignals._clamp_prob(parsed.polymarket_yes),
+            other_markets_note=parsed.other_markets_note,
+        )
+    except Exception as exc:
+        logger.warning("Market signal extraction failed: %s", exc)
+        return MarketSignals()
 
 
 def question_type_guidance(question: MetaculusQuestion) -> str:
@@ -259,10 +340,10 @@ def question_type_guidance(question: MetaculusQuestion) -> str:
         return clean_indents(
             """
             Binary-specific guidance:
-            - Check prediction markets and expert consensus if mentioned in research.
-            - Start from base rate, then update with question-specific evidence.
+            - Check Kalshi, Polymarket, and Metaculus crowd prices in market anchors.
+            - Start from base rate, update with research; markets are weak anchors not verdicts.
             - Avoid extreme probabilities (<5% or >95%) without ironclad resolution evidence.
-            - Explicitly compare Yes vs No scenarios against resolution criteria.
+            - Your sample will be aggregated via **trimmed median** then blended with crowd/market prices.
             """
         )
     if isinstance(question, MultipleChoiceQuestion):
@@ -329,7 +410,8 @@ async def decompose_question(
         f"""
         Decompose this forecast question into 5–8 prioritized web search queries.
 
-        Cover: status quo, Yes triggers, No triggers, expert/market views, recent news.
+        Cover: status quo, Yes triggers, No triggers, expert views, recent news.
+        You MUST include dedicated queries for Kalshi and Polymarket prediction-market odds.
         Most important query first. Each query should be concise (under 15 words).
 
         Question: {question.question_text}
@@ -340,7 +422,24 @@ async def decompose_question(
     decomposed: DecomposedQueries = await structure_output(
         reasoning, DecomposedQueries, model=llm, num_validation_samples=1
     )
-    return decomposed.queries[:8]
+    return _inject_market_queries(decomposed.queries[:8], question.question_text)
+
+
+def _inject_market_queries(queries: list[str], question_text: str) -> list[str]:
+    """Ensure Kalshi/Polymarket are searched even if decomposition omits them."""
+    short_q = question_text[:100].strip()
+    priority = [
+        f"Kalshi market odds {short_q}",
+        f"Polymarket odds {short_q}",
+    ]
+    seen: set[str] = set()
+    merged: list[str] = []
+    for q in priority + queries:
+        key = q.lower().strip()
+        if key and key not in seen:
+            seen.add(key)
+            merged.append(q)
+    return merged[:8]
 
 
 async def estimate_base_rate(
@@ -469,8 +568,55 @@ def trim_outliers_float(values: Sequence[float], trim_fraction: float = 0.2) -> 
 
 
 def aggregate_binary_trimmed(predictions: list[float]) -> float:
+    """Trim outliers then take the median of model samples."""
     trimmed = trim_outliers_float(predictions)
     return float(statistics.median(trimmed))
+
+
+def aggregate_binary_with_markets(
+    predictions: list[float],
+    question: MetaculusQuestion,
+    market_signals: MarketSignals | None = None,
+) -> float:
+    """
+    Blend trimmed **median** of model forecasts with crowd/market anchors.
+
+    Default weights (renormalized when anchors missing):
+      model median 45%, Metaculus 25%, Kalshi 15%, Polymarket 15%
+    """
+    model_median = aggregate_binary_trimmed(predictions)
+    components: list[tuple[str, float, float]] = [
+        ("model_median", model_median, BINARY_BLEND_WEIGHTS["model_median"]),
+    ]
+
+    community = getattr(question, "community_prediction_at_access_time", None)
+    if isinstance(question, BinaryQuestion) and community is not None:
+        components.append(
+            ("metaculus", float(community), BINARY_BLEND_WEIGHTS["metaculus"])
+        )
+
+    if market_signals:
+        if market_signals.kalshi_yes is not None:
+            components.append(
+                ("kalshi", market_signals.kalshi_yes, BINARY_BLEND_WEIGHTS["kalshi"])
+            )
+        if market_signals.polymarket_yes is not None:
+            components.append(
+                (
+                    "polymarket",
+                    market_signals.polymarket_yes,
+                    BINARY_BLEND_WEIGHTS["polymarket"],
+                )
+            )
+
+    total_weight = sum(weight for _, _, weight in components)
+    blended = sum(value * weight for _, value, weight in components) / total_weight
+    logger.info(
+        "Binary blend: %s → final %.1f%%",
+        ", ".join(f"{name}={val:.1%} (w={w})" for name, val, w in components),
+        blended * 100,
+    )
+    return max(0.01, min(0.99, blended))
 
 
 def _distribution_center(dist: NumericDistribution) -> float:
