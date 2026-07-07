@@ -65,17 +65,18 @@ dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-class VultrTavilyBot2026(ForecastBot):
-    """
-    Top-tier strategy bot: Vultr inference + conservative Tavily research.
-
-    Implements decomposition, base rates, time-horizon calibration, trimmed
-    aggregation, resolution parsing, per-type prompts, model routing, calibration
-    logging, and Tavily budget control (free-tier safe).
-    """
+class chineme(ForecastBot):
+    """Chineme — Vultr inference + Tavily research Metaculus bot."""
 
     _max_concurrent_questions = 2  # Parallel questions; Tavily budget still caps searches
     _structure_output_validation_samples = 1  # Save Vultr tokens on parser
+
+    @classmethod
+    def _llm_config_defaults(cls) -> dict[str, str | GeneralLlm | None]:
+        defaults = dict(ForecastBot._llm_config_defaults())
+        defaults["fast"] = None
+        defaults["strong"] = None
+        return defaults
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -228,6 +229,22 @@ class VultrTavilyBot2026(ForecastBot):
             )
 
         logger.info(f"Found Research for URL {question.page_url}:\n{research}")
+        return research
+
+    async def summarize_research(
+        self, question: MetaculusQuestion, research: str
+    ) -> str:
+        """Fall back to raw research if Vultr returns an empty summary."""
+        try:
+            summary = await super().summarize_research(question, research)
+            if summary and summary.strip():
+                return summary
+        except Exception as exc:
+            logger.warning(
+                "Research summary failed for %s (%s); using raw research.",
+                question.page_url,
+                exc,
+            )
         return research
 
     async def _research_and_make_predictions(self, question: MetaculusQuestion):
@@ -809,7 +826,7 @@ if __name__ == "__main__":
     fast_model = os.getenv("VULTR_FAST_MODEL", default_model)
     parser_model = os.getenv("VULTR_PARSER_MODEL", fast_model)
 
-    template_bot = VultrTavilyBot2026(
+    template_bot = chineme(
         research_reports_per_question=2,
         predictions_per_research_report=3,
         use_research_summary_to_forecast=True,
