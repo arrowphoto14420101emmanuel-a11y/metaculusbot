@@ -18,14 +18,17 @@ from tavily_researcher import make_vultr_llm, run_tavily_research
 from bot_strategy import (
     FORECAST_TEMPERATURES,
     CalibrationLogger,
+    MarketSignals,
     QuestionContext,
     TavilyBudget,
-    aggregate_binary_trimmed,
+    aggregate_binary_with_markets,
     aggregate_multiple_choice_trimmed,
     aggregate_numeric_trimmed,
     build_forecast_preamble,
     build_question_context,
+    community_anchor_brief,
     enrich_research_with_context,
+    extract_market_signals,
     question_cache_key,
     research_grounding_instructions,
 )
@@ -78,6 +81,7 @@ class VultrTavilyBot2026(ForecastBot):
         super().__init__(*args, **kwargs)
         self._context_cache: dict[str, QuestionContext] = {}
         self._context_build_locks: dict[str, asyncio.Lock] = {}
+        self._market_signals: dict[str, MarketSignals] = {}
         self.tavily_budget = TavilyBudget.from_env()
         self.calibration_logger = CalibrationLogger()
         self._current_context: QuestionContext | None = None
@@ -238,6 +242,15 @@ class VultrTavilyBot2026(ForecastBot):
         research_to_use = (
             summary_report if self.use_research_summary_to_forecast else research
         )
+        qkey = question_cache_key(question)
+        if qkey not in self._market_signals:
+            self._market_signals[qkey] = await extract_market_signals(
+                question, research_to_use, self.get_llm("fast", "llm")
+            )
+        if context:
+            context.community_anchor = community_anchor_brief(
+                question, self._market_signals[qkey]
+            )
         enriched = enrich_research_with_context(research_to_use, context)
 
         tasks = [
@@ -274,7 +287,10 @@ class VultrTavilyBot2026(ForecastBot):
         if not predictions:
             raise ValueError("Cannot aggregate empty list of predictions")
         if isinstance(question, BinaryQuestion):
-            return aggregate_binary_trimmed(predictions)  # type: ignore[arg-type]
+            signals = self._market_signals.get(question_cache_key(question))
+            return aggregate_binary_with_markets(
+                predictions, question, signals  # type: ignore[arg-type]
+            )
         if isinstance(question, MultipleChoiceQuestion):
             return aggregate_multiple_choice_trimmed(predictions)  # type: ignore[arg-type]
         if isinstance(question, (NumericQuestion, DateQuestion)):
