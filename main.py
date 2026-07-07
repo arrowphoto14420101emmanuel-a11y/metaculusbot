@@ -800,7 +800,7 @@ if __name__ == "__main__":
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=True,
+        extra_metadata_in_explanation=False,
         llms={
             "default": make_vultr_llm(model=default_model, temperature=0.3, timeout=120),
             "strong": make_vultr_llm(model=default_model, temperature=0.35, timeout=150),
