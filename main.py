@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -13,6 +14,7 @@ from bot_helpers import (
     print_startup_banner,
     silence_noisy_dependencies,
 )
+from tavily_researcher import make_vultr_llm, run_tavily_research
 
 silence_noisy_dependencies()
 
@@ -45,115 +47,64 @@ dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-class SummerTemplateBot2026(ForecastBot):
+class VultrTavilyBot2026(ForecastBot):
     """
-    This is the template bot for Summer 2026 Metaculus AI Tournament.
-    This is a copy of what is used by Metaculus to run the Metac Bots in our benchmark, provided as a template for new bot makers.
-    This template is given as-is, and is use-at-your-own-risk.
-    We have covered most test cases in forecasting-tools it may be worth double checking key components locally.
-    So far our track record has been 1 mentionable bug per season (affecting forecasts for 1-2% of total questions)
+    Research-grounded Metaculus bot using Vultr Serverless Inference for LLM calls
+    and Tavily for web research with explicit source citations.
 
-    Main changes since Fall:
-    - Additional prompting has been added to numeric questions to emphasize putting pecentile values in the correct order.
-    - Support for conditional and date questions has been added
-    - Note: Summer AIB will not use date/conditional questions, so these are only for forecasting on the main site as you wish.
-
-    The main entry point of this bot is `bot.forecast_on_tournament(tournament_id)` in the parent class.
-    See the script at the bottom of the file for more details on how to run the bot.
-    Ignoring the finer details, the general flow is:
-    - Load questions from Metaculus
-    - For each question
-        - Execute run_research a number of times equal to research_reports_per_question
-        - Execute respective run_forecast function `predictions_per_research_report * research_reports_per_question` times
-        - Aggregate the predictions
-        - Submit prediction (if publish_reports_to_metaculus is True)
-    - Return a list of ForecastReport objects
-
-    Alternatively, you can use the MetaculusClient to make a custom filter of questions to forecast on
-    and forecast them with `bot.forecast_questions(questions)`
-
-    Only the research and forecast functions need to be implemented in ForecastBot subclasses,
-    though you may want to override other ForecastBot functions.
-    In this example, you can change the prompts to be whatever you want since,
-    structure_output uses an LLM to intelligently reformat the output into the needed structure.
-
-    By default (i.e. 'tournament' mode), when you run this script, it will forecast on any open questions in the
-    primary bot tournament and MiniBench. If you want to forecast on only one or the other, you can remove one
-    of them from the 'tournament' mode code at the bottom of the file.
-
-    You can experiment with what models work best with your bot by using the `llms` parameter when initializing the bot.
-    You can initialize the bot with any number of models. For example,
-    ```python
-    my_bot = MyBot(
-        ...
-        llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-            "default": GeneralLlm(
-                model="openrouter/openai/gpt-4o", # "anthropic/claude-sonnet-4-20250514", etc (see docs for litellm)
-                temperature=0.3,
-                timeout=40,
-                allowed_tries=2,
-            ),
-            "summarizer": "openai/gpt-4o-mini",
-            "researcher": "asknews/news-summaries",
-            "parser": "openai/gpt-4o-mini",
-        },
-    )
-    ```
-
-    Then you can access the model in custom functions like this:
-    ```python
-    research_strategy = self.get_llm("researcher", "model_name"
-    if research_strategy == "asknews/news-summaries":
-        ...
-    # OR
-    summarizer = await self.get_llm("summarizer", "llm").invoke(prompt)
-    # OR
-    reasoning = await self.get_llm("default", "llm").invoke(prompt)
-    ```
-
-    If you end up having trouble with rate limits and want to try a more sophisticated rate limiter try:
-    ```python
-    from forecasting_tools import RefreshingBucketRateLimiter
-    rate_limiter = RefreshingBucketRateLimiter(
-        capacity=2,
-        refresh_rate=1,
-    ) # Allows 1 request per second on average with a burst of 2 requests initially. Set this as a class variable
-    await self.rate_limiter.wait_till_able_to_acquire_resources(1) # 1 because it's consuming 1 request (use more if you are adding a token limit)
-    ```
-    Additionally OpenRouter has large rate limits immediately on account creation
+    Flow per question:
+    - Tavily runs multiple targeted searches (news, background, resolution evidence)
+    - A Vultr model synthesizes a citation-preserving research brief
+    - Multiple forecast samples are drawn and aggregated (median / distribution merge)
     """
 
     _max_concurrent_questions = (
-        1  # Set this to whatever works for your search-provider/ai-model rate limits
+        2  # Tavily + Vultr rate limits; lower if you hit 429s
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+
+    def _research_grounding_instructions(self) -> str:
+        return clean_indents(
+            """
+            Grounding rules:
+            - Base your reasoning on the research assistant's report and cite specific facts inline.
+            - When a claim comes from research, reference the source number or URL from the report.
+            - If research is thin or contradictory, widen uncertainty and say what is missing.
+            - Do not invent news, poll numbers, or events that are not supported by the research.
+            """
+        )
 
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            research = ""
             researcher = self.get_llm("researcher")
 
-            prompt = clean_indents(
-                f"""
-                You are an assistant to a superforecaster.
-                The superforecaster will give you a question they intend to forecast on.
-                To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-                You do not produce forecasts yourself.
+            if researcher in ("tavily", "tavily/raw"):
+                summarizer = (
+                    None
+                    if researcher == "tavily/raw"
+                    else self.get_llm("summarizer", "llm")
+                )
+                research = await run_tavily_research(question, summarizer=summarizer)
+            elif isinstance(researcher, GeneralLlm):
+                prompt = clean_indents(
+                    f"""
+                    You are an assistant to a superforecaster.
+                    The superforecaster will give you a question they intend to forecast on.
+                    To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
+                    You do not produce forecasts yourself.
 
-                Question:
-                {question.question_text}
+                    Question:
+                    {question.question_text}
 
-                This question's outcome will be determined by the specific criteria below:
-                {question.resolution_criteria}
+                    This question's outcome will be determined by the specific criteria below:
+                    {question.resolution_criteria}
 
-                {question.fine_print}
-                """
-            )
-
-            if isinstance(researcher, GeneralLlm):
+                    {question.fine_print}
+                    """
+                )
                 research = await researcher.invoke(prompt)
             elif (
                 researcher == "asknews/news-summaries"
@@ -161,11 +112,40 @@ class SummerTemplateBot2026(ForecastBot):
                 or researcher == "asknews/deep-research/medium-depth"
                 or researcher == "asknews/deep-research/high-depth"
             ):
+                prompt = clean_indents(
+                    f"""
+                    Question:
+                    {question.question_text}
+
+                    Resolution criteria:
+                    {question.resolution_criteria}
+
+                    {question.fine_print}
+                    """
+                )
                 research = await AskNewsSearcher().call_preconfigured_version(
                     researcher, prompt
                 )
-            elif researcher.startswith("smart-searcher"):
+            elif isinstance(researcher, str) and researcher.startswith(
+                "smart-searcher"
+            ):
                 model_name = researcher.removeprefix("smart-searcher/")
+                prompt = clean_indents(
+                    f"""
+                    You are an assistant to a superforecaster.
+                    The superforecaster will give you a question they intend to forecast on.
+                    To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
+                    You do not produce forecasts yourself.
+
+                    Question:
+                    {question.question_text}
+
+                    This question's outcome will be determined by the specific criteria below:
+                    {question.resolution_criteria}
+
+                    {question.fine_print}
+                    """
+                )
                 searcher = SmartSearcher(
                     model=model_name,
                     temperature=0,
@@ -177,7 +157,10 @@ class SummerTemplateBot2026(ForecastBot):
             elif not researcher or researcher == "None" or researcher == "no_research":
                 research = ""
             else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
+                research = await self.get_llm("researcher", "llm").invoke(
+                    question.question_text
+                )
+
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
@@ -215,6 +198,7 @@ class SummerTemplateBot2026(ForecastBot):
             (d) A brief description of a scenario that results in a Yes outcome.
 
             You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
+            {self._research_grounding_instructions()}
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
@@ -277,6 +261,7 @@ class SummerTemplateBot2026(ForecastBot):
             (c) A description of an scenario that results in an unexpected outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
+            {self._research_grounding_instructions()}
             You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
 
             The last thing you write is your final probabilities for the N options in this order {question.options} as:
@@ -365,6 +350,7 @@ class SummerTemplateBot2026(ForecastBot):
             (f) A brief description of an unexpected scenario that results in a high outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
+            {self._research_grounding_instructions()}
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
 
             The last thing you write is your final answer as:
@@ -458,6 +444,7 @@ class SummerTemplateBot2026(ForecastBot):
             (f) A brief description of an unexpected scenario that results in a high outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
+            {self._research_grounding_instructions()}
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
 
             The last thing you write is your final answer as:
@@ -667,28 +654,25 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
-    template_bot = SummerTemplateBot2026(
-        research_reports_per_question=1,
-        predictions_per_research_report=5,
-        use_research_summary_to_forecast=False,
+    default_model = os.getenv("VULTR_INFERENCE_MODEL", "meta-llama/Llama-3.3-70B-Instruct")
+    parser_model = os.getenv("VULTR_PARSER_MODEL", default_model)
+
+    template_bot = VultrTavilyBot2026(
+        research_reports_per_question=2,
+        predictions_per_research_report=3,
+        use_research_summary_to_forecast=True,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms={
+            "default": make_vultr_llm(model=default_model, temperature=0.3, timeout=120),
+            "summarizer": make_vultr_llm(
+                model=default_model, temperature=0.2, timeout=120
+            ),
+            "researcher": "tavily",
+            "parser": make_vultr_llm(model=parser_model, temperature=0, timeout=90),
+        },
     )
 
     # Per-mode tournament URL shown in the summary banner footer. These
