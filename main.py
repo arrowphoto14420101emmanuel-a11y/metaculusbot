@@ -15,6 +15,20 @@ from bot_helpers import (
     silence_noisy_dependencies,
 )
 from tavily_researcher import make_vultr_llm, run_tavily_research
+from bot_strategy import (
+    FORECAST_TEMPERATURES,
+    CalibrationLogger,
+    QuestionContext,
+    TavilyBudget,
+    aggregate_binary_trimmed,
+    aggregate_multiple_choice_trimmed,
+    aggregate_numeric_trimmed,
+    build_forecast_preamble,
+    build_question_context,
+    enrich_research_with_context,
+    question_cache_key,
+    research_grounding_instructions,
+)
 
 silence_noisy_dependencies()
 
@@ -22,6 +36,7 @@ from forecasting_tools import (
     AskNewsSearcher,
     BinaryQuestion,
     ForecastBot,
+    ForecastReport,
     GeneralLlm,
     MetaculusClient,
     MetaculusQuestion,
@@ -49,36 +64,76 @@ logger = logging.getLogger(__name__)
 
 class VultrTavilyBot2026(ForecastBot):
     """
-    Research-grounded Metaculus bot using Vultr Serverless Inference for LLM calls
-    and Tavily for web research with explicit source citations.
+    Top-tier strategy bot: Vultr inference + conservative Tavily research.
 
-    Flow per question:
-    - Tavily runs multiple targeted searches (news, background, resolution evidence)
-    - A Vultr model synthesizes a citation-preserving research brief
-    - Multiple forecast samples are drawn and aggregated (median / distribution merge)
+    Implements decomposition, base rates, time-horizon calibration, trimmed
+    aggregation, resolution parsing, per-type prompts, model routing, calibration
+    logging, and Tavily budget control (free-tier safe).
     """
 
-    _max_concurrent_questions = (
-        2  # Tavily + Vultr rate limits; lower if you hit 429s
-    )
+    _max_concurrent_questions = 1  # Conservative for free Tavily + Vultr limits
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
-    _structure_output_validation_samples = 2
+    _structure_output_validation_samples = 1  # Save Vultr tokens on parser
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._context_cache: dict[str, QuestionContext] = {}
+        self.tavily_budget = TavilyBudget.from_env()
+        self.calibration_logger = CalibrationLogger()
+        self._current_context: QuestionContext | None = None
+        self._sample_index = 0
+        self._forecast_llms: dict[float, GeneralLlm] = {}
+        self._init_forecast_llms()
+
+    def _init_forecast_llms(self) -> None:
+        strong = self._llms.get("strong") or self._llms.get("default")
+        if isinstance(strong, GeneralLlm):
+            raw_model = strong.model
+            model_name = raw_model.removeprefix("openai/")
+            timeout = strong.litellm_kwargs.get("timeout", 120)
+            for temp in FORECAST_TEMPERATURES:
+                self._forecast_llms[temp] = make_vultr_llm(
+                    model=model_name,
+                    temperature=temp,
+                    timeout=timeout,
+                )
+
+    async def _get_question_context(self, question: MetaculusQuestion) -> QuestionContext:
+        key = question_cache_key(question)
+        if key not in self._context_cache:
+            fast_llm = self.get_llm("fast", "llm")
+            self._context_cache[key] = await build_question_context(question, fast_llm)
+        return self._context_cache[key]
+
+    async def _invoke_forecast_llm(self, prompt: str) -> str:
+        context = self._current_context
+        temp = FORECAST_TEMPERATURES[self._sample_index % len(FORECAST_TEMPERATURES)]
+        if context and context.difficulty == "hard":
+            return await self.get_llm("strong", "llm").invoke(prompt)
+        llm = self._forecast_llms.get(temp) or self.get_llm("default", "llm")
+        return await llm.invoke(prompt)
 
     def _research_grounding_instructions(self) -> str:
-        return clean_indents(
-            """
-            Grounding rules:
-            - Base your reasoning on the research assistant's report and cite specific facts inline.
-            - When a claim comes from research, reference the source number or URL from the report.
-            - If research is thin or contradictory, widen uncertainty and say what is missing.
-            - Do not invent news, poll numbers, or events that are not supported by the research.
-            """
-        )
+        return research_grounding_instructions()
+
+    def _forecast_preamble(self, research: str) -> str:
+        if self._current_context:
+            return clean_indents(
+                f"""
+                {build_forecast_preamble(self._current_context)}
+
+                ## Research report
+                {research}
+                """
+            )
+        return research
 
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
+            context = await self._get_question_context(question)
+            self._current_context = context
             researcher = self.get_llm("researcher")
 
             if researcher in ("tavily", "tavily/raw"):
@@ -87,7 +142,9 @@ class VultrTavilyBot2026(ForecastBot):
                     if researcher == "tavily/raw"
                     else self.get_llm("summarizer", "llm")
                 )
-                research = await run_tavily_research(question, summarizer=summarizer)
+                research = await run_tavily_research(
+                    question, context, self.tavily_budget, summarizer=summarizer
+                )
             elif isinstance(researcher, GeneralLlm):
                 prompt = clean_indents(
                     f"""
@@ -164,6 +221,82 @@ class VultrTavilyBot2026(ForecastBot):
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
+    async def _research_and_make_predictions(self, question: MetaculusQuestion):
+        from forecasting_tools.forecast_bots.forecast_bot import ResearchWithPredictions
+
+        context = await self._get_question_context(question)
+        self._current_context = context
+        notepad = await self._get_notepad(question)
+        notepad.total_research_reports_attempted += 1
+        research = await self.run_research(question)
+        summary_report = await self.summarize_research(question, research)
+        research_to_use = (
+            summary_report if self.use_research_summary_to_forecast else research
+        )
+        enriched = enrich_research_with_context(research_to_use, context)
+
+        tasks = [
+            self._make_prediction_with_sample(question, enriched, i)
+            for i in range(self.predictions_per_research_report)
+        ]
+        valid_predictions, errors, exception_group = (
+            await self._gather_results_and_exceptions(tasks)
+        )
+        if errors:
+            logger.warning(f"Encountered errors while predicting: {errors}")
+        if len(valid_predictions) == 0:
+            assert exception_group
+            self._reraise_exception_with_prepended_message(
+                exception_group,
+                "Error while running research and predictions",
+            )
+        return ResearchWithPredictions(
+            research_report=research,
+            summary_report=summary_report,
+            errors=errors,
+            predictions=valid_predictions,
+        )
+
+    async def _make_prediction_with_sample(
+        self, question: MetaculusQuestion, research: str, sample_index: int
+    ):
+        self._sample_index = sample_index
+        return await self._make_prediction(question, research)
+
+    async def _aggregate_predictions(
+        self, predictions: list[PredictionTypes], question: MetaculusQuestion
+    ) -> PredictionTypes:
+        if not predictions:
+            raise ValueError("Cannot aggregate empty list of predictions")
+        if isinstance(question, BinaryQuestion):
+            return aggregate_binary_trimmed(predictions)  # type: ignore[arg-type]
+        if isinstance(question, MultipleChoiceQuestion):
+            return aggregate_multiple_choice_trimmed(predictions)  # type: ignore[arg-type]
+        if isinstance(question, (NumericQuestion, DateQuestion)):
+            return aggregate_numeric_trimmed(predictions, question)  # type: ignore[arg-type]
+        report_type = DataOrganizer.get_report_type_for_question_type(type(question))
+        return await report_type.aggregate_predictions(predictions, question)
+
+    async def _run_individual_question(self, question: MetaculusQuestion) -> ForecastReport:
+        report = await super()._run_individual_question(question)
+        try:
+            self.calibration_logger.log_forecast(
+                question=question,
+                prediction=report.prediction,
+                community_prediction=getattr(
+                    question, "community_prediction_at_access_time", None
+                ),
+                question_type=type(question).__name__,
+            )
+        except Exception as exc:
+            logger.warning("Calibration logging failed: %s", exc)
+        logger.info(
+            "Tavily searches used this run: %s/%s",
+            self.tavily_budget.searches_used,
+            self.tavily_budget.max_per_run,
+        )
+        return report
+
     ##################################### BINARY QUESTIONS #####################################
 
     async def _run_forecast_on_binary(
@@ -187,18 +320,18 @@ class VultrTavilyBot2026(ForecastBot):
 
 
             Your research assistant says:
-            {research}
+            {self._forecast_preamble(research)}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
+            (b) The status quo outcome if nothing changed — start from the base rate.
             (c) A brief description of a scenario that results in a No outcome.
             (d) A brief description of a scenario that results in a Yes outcome.
+            (e) How much to update from the base rate given cited evidence.
 
-            You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
-            {self._research_grounding_instructions()}
+            You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, adjusted for time horizon guidance above.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
@@ -212,7 +345,7 @@ class VultrTavilyBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecast_llm(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         binary_prediction: BinaryPrediction = await structure_output(
             reasoning,
@@ -251,7 +384,7 @@ class VultrTavilyBot2026(ForecastBot):
 
 
             Your research assistant says:
-            {research}
+            {self._forecast_preamble(research)}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
@@ -261,7 +394,6 @@ class VultrTavilyBot2026(ForecastBot):
             (c) A description of an scenario that results in an unexpected outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            {self._research_grounding_instructions()}
             You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
 
             The last thing you write is your final probabilities for the N options in this order {question.options} as:
@@ -287,7 +419,7 @@ class VultrTavilyBot2026(ForecastBot):
             Additionally, you may sometimes need to parse a 0% probability. Please do not skip options with 0% but rather make it an entry in your final list with 0% probability.
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecast_llm(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning,
@@ -329,7 +461,7 @@ class VultrTavilyBot2026(ForecastBot):
             Units for answer: {question.unit_of_measure if question.unit_of_measure else "Not stated (please infer this)"}
 
             Your research assistant says:
-            {research}
+            {self._forecast_preamble(research)}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
@@ -343,14 +475,13 @@ class VultrTavilyBot2026(ForecastBot):
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
+            (b) The current value / status quo baseline from research.
             (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
+            (d) The expectations of experts and markets (from research).
             (e) A brief description of an unexpected scenario that results in a low outcome.
             (f) A brief description of an unexpected scenario that results in a high outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            {self._research_grounding_instructions()}
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
 
             The last thing you write is your final answer as:
@@ -371,7 +502,7 @@ class VultrTavilyBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecast_llm(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -422,7 +553,7 @@ class VultrTavilyBot2026(ForecastBot):
             {question.fine_print}
 
             Your research assistant says:
-            {research}
+            {self._forecast_preamble(research)}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
@@ -437,14 +568,13 @@ class VultrTavilyBot2026(ForecastBot):
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
+            (b) The current timeline / status quo from research.
             (c) The outcome if the current trend continued.
             (d) The expectations of experts and markets.
             (e) A brief description of an unexpected scenario that results in a low outcome.
             (f) A brief description of an unexpected scenario that results in a high outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            {self._research_grounding_instructions()}
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
 
             The last thing you write is your final answer as:
@@ -466,7 +596,7 @@ class VultrTavilyBot2026(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecast_llm(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -655,10 +785,11 @@ if __name__ == "__main__":
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
     default_model = os.getenv("VULTR_INFERENCE_MODEL", "meta-llama/Llama-3.3-70B-Instruct")
-    parser_model = os.getenv("VULTR_PARSER_MODEL", default_model)
+    fast_model = os.getenv("VULTR_FAST_MODEL", default_model)
+    parser_model = os.getenv("VULTR_PARSER_MODEL", fast_model)
 
     template_bot = VultrTavilyBot2026(
-        research_reports_per_question=2,
+        research_reports_per_question=1,
         predictions_per_research_report=3,
         use_research_summary_to_forecast=True,
         publish_reports_to_metaculus=publish_to_metaculus,
@@ -667,11 +798,13 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=True,
         llms={
             "default": make_vultr_llm(model=default_model, temperature=0.3, timeout=120),
+            "strong": make_vultr_llm(model=default_model, temperature=0.35, timeout=150),
+            "fast": make_vultr_llm(model=fast_model, temperature=0.1, timeout=60),
             "summarizer": make_vultr_llm(
                 model=default_model, temperature=0.2, timeout=120
             ),
             "researcher": "tavily",
-            "parser": make_vultr_llm(model=parser_model, temperature=0, timeout=90),
+            "parser": make_vultr_llm(model=parser_model, temperature=0, timeout=60),
         },
     )
 

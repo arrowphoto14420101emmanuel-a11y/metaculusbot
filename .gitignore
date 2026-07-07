@@ -1,6 +1,7 @@
 ###  Specific to Project ###
 benchmarks/
 sandbox.py
+calibration_log.jsonl
 
 
 ### General gitignore ###
