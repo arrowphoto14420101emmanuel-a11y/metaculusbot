@@ -65,8 +65,8 @@ dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-class chineme(ForecastBot):
-    """Chineme — Vultr inference + Tavily research Metaculus bot."""
+class oracledeckv2(ForecastBot):
+    """Oracledeckv2 — Vultr inference + Tavily research Metaculus bot."""
 
     _max_concurrent_questions = 2  # Parallel questions; Tavily budget still caps searches
     _structure_output_validation_samples = 1  # Save Vultr tokens on parser
@@ -826,7 +826,7 @@ if __name__ == "__main__":
     fast_model = os.getenv("VULTR_FAST_MODEL", default_model)
     parser_model = os.getenv("VULTR_PARSER_MODEL", fast_model)
 
-    template_bot = chineme(
+    template_bot = oracledeckv2(
         research_reports_per_question=2,
         predictions_per_research_report=3,
         use_research_summary_to_forecast=True,
